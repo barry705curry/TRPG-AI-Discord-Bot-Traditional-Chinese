@@ -1,1 +1,12 @@
+# 環境變數與金鑰
 .env
+
+# Python 快取與虛擬環境
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE / 編輯器
+.idea/
+.vscode/
