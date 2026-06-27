@@ -19,8 +19,29 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
-with open('config/rulebook.md', 'r', encoding='utf-8') as f:
-    system_prompt = f.read()
+# 規則模組化：啟動時一次性載入各分冊，依 AI 呼叫類型組裝 system_instruction，
+# 避免每次呼叫都把整本規則塞進 system_prompt（降低雜訊、提升遵規精準度）。
+RULES_DIR = 'config/rules'
+
+def _load_rule(name):
+    with open(f'{RULES_DIR}/{name}.md', 'r', encoding='utf-8') as f:
+        return f.read()
+
+RULES = {name: _load_rule(name) for name in ('common', 'creation', 'gameplay', 'dice')}
+
+def build_system_instruction(call_type, current_status=None):
+    """依呼叫類型與當前狀態組裝對應的規則分冊。
+    - dice      : 裁判擲骰，只需第三部分。
+    - memory    : 記憶萃取，格式已 inline 在 prompt，不需規則（回傳 None）。
+    - storyteller: 說書人，依 current_status 給創建或遊玩規則。
+    """
+    if call_type == 'dice':
+        return RULES['dice']
+    if call_type == 'memory':
+        return None
+    if current_status == '副本進行中':
+        return "\n\n".join((RULES['common'], RULES['gameplay'], RULES['dice']))
+    return "\n\n".join((RULES['common'], RULES['creation']))
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 TARGET_MODEL = 'gemini-2.5-flash'
@@ -193,12 +214,18 @@ async def load_game_world():
         data["public"] = {
             "current_dungeon_name": "未定", "theme": "未定", "genre": "未定", "mechanic": "未定",
             "victory_condition": "未定", "intro": "未定", "starting_location": "未定",
-            "adventure_log": []
+            "current_location": {}, "adventure_log": []
         }
     if "adventure_log" not in data["public"] or not isinstance(data["public"]["adventure_log"], list):
         data["public"]["adventure_log"] = []
-        
-    if "secret" not in data or not isinstance(data["secret"], dict): 
+
+    # current_location：追蹤「每個角色」目前所在位置的字典 {角色名: 地點}，
+    # 與永久不變的 starting_location 區隔，並支援隊伍分頭探索（對接戰爭迷霧鐵律）。
+    # 僅確保欄位存在；舊版單一字串格式會在 on_message 依當前角色名展開為字典。
+    if "current_location" not in data["public"]:
+        data["public"]["current_location"] = {}
+
+    if "secret" not in data or not isinstance(data["secret"], dict):
         data["secret"] = {}
 
     return data
@@ -257,9 +284,9 @@ async def save_dungeon_history(data):
 # 🌟 高穩 API 呼叫函式
 # ==========================================
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=2, min=4, max=20), retry=retry_if_exception_type(Exception), reraise=True)
-async def safe_generate_content(prompt_text, temperature=0.7):
+async def safe_generate_content(prompt_text, system_instruction, temperature=0.7):
     config = genai.types.GenerateContentConfig(
-        system_instruction=system_prompt,
+        system_instruction=system_instruction,
         temperature=temperature
     )
     response = await ai_client.aio.models.generate_content(
@@ -298,11 +325,30 @@ async def on_message(message):
     async with gm_lock:
         async with message.channel.typing():
             try:
+                # 系統提示訊息（裁判運算中、擲骰廣播、存檔/記憶提示等）的開頭符號，
+                # 這些不是劇情，納入上下文只會干擾 AI，需略過。
+                SYSTEM_PREFIXES = ("⚖️", "🎲", "💾", "🧠", "📊", "🌍", "⚙️", "🛑", "⚠️")
                 recent_msgs = []
+                previous_scene = ""  # 上一則 GM 敘事，獨立餵給 AI 作場景銜接，不混入玩家發言
                 async for msg in message.channel.history(limit=50):
-                    if msg.author == client.user and msg.id != message.id: break
+                    if msg.id == message.id:
+                        recent_msgs.append(msg)
+                        continue
+                    is_bot = (msg.author == client.user)
+                    # 跳過機器人的系統提示訊息（裁判運算中、擲骰廣播、存檔/記憶提示等）。
+                    if is_bot and msg.content.strip().startswith(SYSTEM_PREFIXES):
+                        continue
+                    if is_bot:
+                        # 抓到「上一則 GM 敘事」即停止：另存到 previous_scene 作場景銜接，
+                        # 不放進玩家發言串，避免 AI 把自己的敘事誤認成玩家輸入而混淆。
+                        previous_scene = msg.content.replace(f"<@{client.user.id}>", "").strip()
+                        break
                     recent_msgs.append(msg)
                 recent_msgs.reverse()
+
+                # 上一幕敘事可能很長，裁到尾段（通常是收尾＋選項）以控制 token 成本。
+                if len(previous_scene) > 1500:
+                    previous_scene = "...(前略)...\n" + previous_scene[-1500:]
 
                 compiled_text = ""
                 for msg in recent_msgs:
@@ -349,7 +395,7 @@ async def on_message(message):
                         "public": {
                             "current_dungeon_name": "未定", "theme": "未定", "genre": "未定",
                             "mechanic": "未定", "victory_condition": "未定", "intro": "未定",
-                            "starting_location": "未定", "adventure_log": []
+                            "starting_location": "未定", "current_location": {}, "adventure_log": []
                         },
                         "secret": {}
                     }
@@ -389,10 +435,35 @@ async def on_message(message):
                 pub_data = current_world["public"]
                 sec_data = current_world["secret"]
 
+                # 正規化 current_location 為 {角色: 地點} 字典，相容舊版單一字串格式：
+                # 舊字串代表「全隊在同一處」，依當前角色名展開為個別位置。
+                start_loc = pub_data.get("starting_location", "未定")
+                loc_map = pub_data.get("current_location")
+                if not isinstance(loc_map, dict):
+                    legacy = loc_map if isinstance(loc_map, str) and loc_map not in ("", "未定") else start_loc
+                    loc_map = {name: legacy for name in current_chars}
+                    pub_data["current_location"] = loc_map
+
+                # 逐角色列出位置；沒有專屬紀錄的角色，視為仍在起始地點。
+                loc_lines = ""
+                for name in current_chars:
+                    loc_lines += f"　- {name}：{loc_map.get(name) or start_loc}\n"
+                for name, loc in loc_map.items():  # 涵蓋角色卡以外（如 NPC/離隊）的位置紀錄
+                    if name not in current_chars:
+                        loc_lines += f"　- {name}：{loc}\n"
+                if not loc_lines:
+                    loc_lines = f"　- （全體）：{start_loc}\n"
+
                 world_section = f"""
 ===========
 PUBLIC_WORLD [系統資訊：當前世界觀與「長期記憶日誌 (adventure_log)」]
 ===========
+📍【各角色目前所在位置 / current_location】
+{loc_lines}（⚠️ 位置鐵則：每位角色描述「你現在位在……」時，必須各自對應上方該角色的位置。
+　starting_location 只是副本最初的出生點，角色早已可能離開並深入其他區域，絕對禁止無故把角色寫回起始點！
+　戰爭迷霧：分頭行動的角色彼此看不到對方所在，嚴禁讓 A 知道只有 B 在場才看得到的事物。
+　請對照下方 adventure_log 確認各角色的移動軌跡。）
+
 {BK}json
 {json.dumps(pub_data, ensure_ascii=False, indent=2)}
 {BK}
@@ -448,7 +519,7 @@ MONSTER_DATABASE [怪物圖鑑]
                     [近期對話]
                     {compiled_text}
                     """
-                    dice_req_text = await safe_generate_content(dice_check_prompt, temperature=0.1)
+                    dice_req_text = await safe_generate_content(dice_check_prompt, build_system_instruction('dice'), temperature=0.1)
                     
                     # 刪除「運算中」的提示
                     try: await status_msg.delete() 
@@ -477,6 +548,13 @@ MONSTER_DATABASE [怪物圖鑑]
                     【GM 任務：推進劇情】
                     {dice_result_for_ai}
                     請根據玩家行動與上方【裁判系統擲骰結果】推進劇情，給出沉浸感的敘事回覆。
+                    📍【位置追蹤｜每回合必做】：本回合敘事結束後，請務必在回覆最後輸出以下精簡標籤，
+                    　以 {{角色名: 地點}} 逐一填入每位角色「這一幕結束時」的所在位置（移動了就更新，沒移動就照填目前位置）。
+                    　隊伍在一起時就把各角色填成同一地點；分頭行動時各自填各自的位置。
+                    　這「不是」重新生成副本，僅更新位置，副本核心設定與 secret 一律不得改動：
+                    {BK}json game_world
+                    {{ "public": {{ "current_location": {{ "角色名": "該角色此刻明確的所在地點（例：神社正殿 銅鏡神龕前）" }} }} }}
+                    {BK}
                     ⚠️ 【系統指令】：若本次劇情發生了「戰鬥、線索、重要抉擇」，請務必在回覆最後加上以下 JSON 標籤來喚醒記憶子系統：
                     {BK}json memory_flag
                     {{ "trigger": true }}
@@ -494,6 +572,18 @@ MONSTER_DATABASE [怪物圖鑑]
                     ⚠️ 絕對禁止生成與以下標籤相似的副本：{blacklist_str}
                     """
 
+                # 上一幕 GM 敘事：獨立區塊，明確標示「這是你自己的上一幕、非玩家發言」，
+                # 讓 AI 能銜接「那扇門/那個選項/剛剛那句話」等指涉，又不會誤把它當成要回應的玩家輸入。
+                if previous_scene:
+                    previous_scene_section = f"""
+                ===========
+                【上一幕場景（你自己上次的敘事，僅供銜接：請延續此場景與位置，勿重複照抄、勿當成玩家發言）】
+                ===========
+                {previous_scene}
+"""
+                else:
+                    previous_scene_section = ""
+
                 prompt = f"""
                 【GM後台資料】
                 {world_section}
@@ -508,7 +598,7 @@ MONSTER_DATABASE [怪物圖鑑]
                 {BK}json
                 {encyclopedia_str}
                 {BK}
-
+                {previous_scene_section}
                 ===========
                 玩家本回合發言
                 ===========
@@ -518,7 +608,7 @@ MONSTER_DATABASE [怪物圖鑑]
                 # 📜 階段二：說書人 (GM Storyteller)
                 # ==========================================
                 try:
-                    reply_text = await safe_generate_content(prompt, temperature=0.7)
+                    reply_text = await safe_generate_content(prompt, build_system_instruction('storyteller', current_status), temperature=0.7)
 
                     trigger_memory = False
                     pattern_mem = rf"{BK}json\s+memory_flag\s*(.*?){BK}"
@@ -592,7 +682,7 @@ MONSTER_DATABASE [怪物圖鑑]
                         玩家：{compiled_text}
                         GM：{reply_text}
                         """
-                        mem_response_text = await safe_generate_content(memory_prompt, temperature=0.2)
+                        mem_response_text = await safe_generate_content(memory_prompt, build_system_instruction('memory'), temperature=0.2)
                         
                         pattern = rf"{BK}json[\s\n]*game_world[\s\n]*(.*?)\n{BK}"
                         match = re.search(pattern, mem_response_text, re.DOTALL | re.IGNORECASE)
