@@ -350,10 +350,34 @@ async def on_message(message):
                 if len(previous_scene) > 1500:
                     previous_scene = "...(前略)...\n" + previous_scene[-1500:]
 
+                # 「DC 顯示名 → author.id」對照（取自本回合發言者）：
+                # 創角時用來把 AI 寫入的「玩家」欄位回查成穩定的 discord_id（AI 看不到 id，只有 code 看得到）。
+                author_name_to_id = {}
+                for m in recent_msgs:
+                    if m.author != client.user:
+                        author_name_to_id[m.author.display_name] = str(m.author.id)
+
+                # 身分對照：用角色卡上的 discord_id / 玩家(DC名) 反查「角色卡名」，
+                # 讓玩家發言能標成「朋臻（操作角色：林夜白）」，AI 不必每回合自己猜歸屬。
+                current_chars = await load_characters()
+                id_to_char, dcname_to_char = {}, {}
+                for cname, cdata in current_chars.items():
+                    if not isinstance(cdata, dict): continue
+                    did = cdata.get("discord_id")
+                    if did: id_to_char[str(did)] = cname
+                    pname = cdata.get("玩家")
+                    if pname: dcname_to_char[pname] = cname
+
                 compiled_text = ""
                 for msg in recent_msgs:
                     clean_content = msg.content.replace(f"<@{client.user.id}>", "").strip()
-                    if clean_content: compiled_text += f"{msg.author.display_name}: {clean_content}\n"
+                    if not clean_content: continue
+                    speaker = msg.author.display_name
+                    char = id_to_char.get(str(msg.author.id)) or dcname_to_char.get(speaker)
+                    if char:
+                        compiled_text += f"{speaker}（操作角色：{char}）: {clean_content}\n"
+                    else:
+                        compiled_text += f"{speaker}: {clean_content}\n"
                 
                 if not compiled_text.strip(): return
                 if len(compiled_text) > 12000:
@@ -405,8 +429,7 @@ async def on_message(message):
                     await message.channel.send("🛑 **[系統公告] 輪迴通道已關閉，本次跑團正式結束。**")
                     return
 
-                # 讀取世界與後台資料
-                current_chars = await load_characters()
+                # 讀取世界與後台資料（current_chars 已於前面建立身分對照時載入）
                 char_status_str = json.dumps(current_chars, ensure_ascii=False, indent=2)
                 current_encyclopedia = await load_encyclopedia()
                 encyclopedia_str = json.dumps(current_encyclopedia, ensure_ascii=False, indent=2)
@@ -572,6 +595,21 @@ MONSTER_DATABASE [怪物圖鑑]
                     ⚠️ 絕對禁止生成與以下標籤相似的副本：{blacklist_str}
                     """
 
+                # 玩家對照表：把已綁定的「DC 名 ＝ 角色卡名」明列給 AI，
+                # 讓它不必從上下文猜「朋臻 操作的是林夜白」，發言歸屬與分角色定位才站得穩。
+                roster_lines = ""
+                for cname, cdata in current_chars.items():
+                    if isinstance(cdata, dict) and cdata.get("玩家"):
+                        roster_lines += f"　- {cdata['玩家']} ＝ {cname}\n"
+                if roster_lines:
+                    roster_section = f"""
+                ===========
+                玩家對照表 [DC 使用者 ＝ 操作角色]（發言已標註歸屬，請嚴格依此分辨誰是誰）
+                ===========
+                {roster_lines}"""
+                else:
+                    roster_section = ""
+
                 # 上一幕 GM 敘事：獨立區塊，明確標示「這是你自己的上一幕、非玩家發言」，
                 # 讓 AI 能銜接「那扇門/那個選項/剛剛那句話」等指涉，又不會誤把它當成要回應的玩家輸入。
                 if previous_scene:
@@ -593,6 +631,7 @@ MONSTER_DATABASE [怪物圖鑑]
                 {BK}json
                 {char_status_str}
                 {BK}
+                {roster_section}
 
                 ENCYCLOPEDIA [字典]
                 {BK}json
@@ -636,6 +675,13 @@ MONSTER_DATABASE [怪物圖鑑]
                         if match:
                             try:
                                 new_data = json.loads(match.group(1).strip())
+                                # 創角階段：把 AI 寫入的「玩家」(DC 顯示名) 回查成穩定 discord_id 後再存。
+                                if tag == "characters" and isinstance(new_data, dict):
+                                    for cdata in new_data.values():
+                                        if isinstance(cdata, dict):
+                                            pname = cdata.get("玩家")
+                                            if pname and not cdata.get("discord_id") and pname in author_name_to_id:
+                                                cdata["discord_id"] = author_name_to_id[pname]
                                 await save_func(new_data)
                                 updated_files.append(tag)
                                 reply_text = re.sub(pattern, "", reply_text, flags=re.DOTALL | re.IGNORECASE).strip()
