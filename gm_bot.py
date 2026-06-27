@@ -19,7 +19,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
-with open('config/rulebook.txt', 'r', encoding='utf-8') as f:
+with open('config/rulebook.md', 'r', encoding='utf-8') as f:
     system_prompt = f.read()
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
