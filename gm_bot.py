@@ -369,6 +369,7 @@ async def on_message(message):
                     if pname: dcname_to_char[pname] = cname
 
                 compiled_text = ""
+                acting_chars = set()  # 本回合有發言/行動的角色卡名，供 adventure_log 選擇性注入
                 for msg in recent_msgs:
                     clean_content = msg.content.replace(f"<@{client.user.id}>", "").strip()
                     if not clean_content: continue
@@ -376,6 +377,7 @@ async def on_message(message):
                     char = id_to_char.get(str(msg.author.id)) or dcname_to_char.get(speaker)
                     if char:
                         compiled_text += f"{speaker}（操作角色：{char}）: {clean_content}\n"
+                        acting_chars.add(char)
                     else:
                         compiled_text += f"{speaker}: {clean_content}\n"
                 
@@ -477,6 +479,21 @@ async def on_message(message):
                 if not loc_lines:
                     loc_lines = f"　- （全體）：{start_loc}\n"
 
+                # adventure_log 選擇性注入：每條事件可帶 witnesses（目擊角色名）。
+                # 缺漏或空 = 全體共知（含舊資料）；否則只注入「本回合行動角色」看得到的事件，
+                # 兼顧戰爭迷霧（不洩漏他人私有線索）與 token 成本。無可辨識行動角色時不過濾。
+                full_log = pub_data.get("adventure_log", [])
+                if isinstance(full_log, list) and acting_chars:
+                    visible_log = [
+                        e for e in full_log
+                        if not (isinstance(e, dict) and e.get("witnesses"))
+                        or bool(set(e.get("witnesses", [])) & acting_chars)
+                    ]
+                else:
+                    visible_log = full_log
+                pub_for_dump = dict(pub_data)
+                pub_for_dump["adventure_log"] = visible_log
+
                 world_section = f"""
 ===========
 PUBLIC_WORLD [系統資訊：當前世界觀與「長期記憶日誌 (adventure_log)」]
@@ -488,7 +505,7 @@ PUBLIC_WORLD [系統資訊：當前世界觀與「長期記憶日誌 (adventure_
 　請對照下方 adventure_log 確認各角色的移動軌跡。）
 
 {BK}json
-{json.dumps(pub_data, ensure_ascii=False, indent=2)}
+{json.dumps(pub_for_dump, ensure_ascii=False, indent=2)}
 {BK}
 """
                 if current_status in ["尚未創建副本", "等待玩家資料", "副本生成中", "副本進行中"]:
@@ -714,16 +731,21 @@ MONSTER_DATABASE [怪物圖鑑]
                         memory_prompt = f"""
                         【系統任務：記憶萃取】
                         請判斷剛才的互動發生了什麼「推動劇情的重要事件」？
-                        請嚴格輸出以下 JSON (包含 event, type, importance)：
+                        請嚴格輸出以下 JSON (每條事件包含 event, type, importance, witnesses)：
                         {BK}json game_world
                         {{
                           "public": {{
                             "adventure_log": [
-                              {{ "event": "玩家推開地下室的門發現符號。", "type": "clue", "importance": 3 }}
+                              {{ "event": "林夜白推開地下室的門發現符號。", "type": "clue", "importance": 3, "witnesses": ["林夜白"] }}
                             ]
                           }}
                         }}
                         {BK}
+                        ⚠️ witnesses 規則（防洩漏，極重要）：列出「親身經歷／目擊這件事的角色卡名」。
+                        - 全體一同在場經歷 → 列出所有在場角色。
+                        - 只有某角色獨自經歷 → 只列該角色。
+                        - 判斷不確定時，寧可少列（只列當事角色），絕對不可把只有一人知道的事列成全體，以免洩漏戰爭迷霧。
+                        - 請用「操作角色」名稱（如林夜白），不要用 Discord 名（如朋臻）。
                         [對話紀錄]
                         玩家：{compiled_text}
                         GM：{reply_text}
@@ -743,6 +765,15 @@ MONSTER_DATABASE [怪物圖鑑]
                                     for log in logs:
                                         if isinstance(log, dict) and log.get('event'):
                                             log["event_id"] = f"evt_{uuid.uuid4().hex[:8]}"
+                                            # 清洗 witnesses：DC 名轉角色名；缺漏時保守預設為「本回合行動角色」，
+                                            # 不外洩給未在場者（acting_chars 為空時才退回全體＝維持舊行為）。
+                                            w = log.get("witnesses")
+                                            if isinstance(w, list) and w:
+                                                log["witnesses"] = [dcname_to_char.get(str(x), str(x)) for x in w]
+                                            elif acting_chars:
+                                                log["witnesses"] = sorted(acting_chars)
+                                            else:
+                                                log.pop("witnesses", None)  # 無從判斷 → 視為全體共知
                                             latest_world["public"]["adventure_log"].append(log)
                                             log_events.append(log['event'])
                                             
