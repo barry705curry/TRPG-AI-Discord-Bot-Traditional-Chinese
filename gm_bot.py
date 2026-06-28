@@ -28,16 +28,19 @@ def _load_rule(name):
     with open(f'{RULES_DIR}/{name}.md', 'r', encoding='utf-8') as f:
         return f.read()
 
-RULES = {name: _load_rule(name) for name in ('common', 'creation', 'gameplay', 'dice')}
+RULES = {name: _load_rule(name) for name in ('common', 'creation', 'gameplay', 'dice', 'dice_flow')}
 
 def build_system_instruction(call_type, current_status=None):
     """依呼叫類型與當前狀態組裝對應的規則分冊。
-    - dice      : 裁判擲骰，只需第三部分。
+    - dice      : 裁判擲骰，給「冷酷判定哲學(dice) + 強制判定流程(dice_flow，含 dice_request 格式)」。
     - memory    : 記憶萃取，格式已 inline 在 prompt，不需規則（回傳 None）。
     - storyteller: 說書人，依 current_status 給創建或遊玩規則。
+                   ⚠️ 說書人只拿 dice 的判定哲學，「絕對不」載入 dice_flow——
+                   擲骰由 Python 獨立裁判處理，若把 dice_request 流程餵給說書人，
+                   會與「嚴禁自行擲骰」矛盾，導致它吐出 dice_request 裸 JSON 洩漏給玩家。
     """
     if call_type == 'dice':
-        return RULES['dice']
+        return "\n\n".join((RULES['dice'], RULES['dice_flow']))
     if call_type == 'memory':
         return None
     if current_status == '副本進行中':
@@ -182,8 +185,48 @@ def execute_dice_rolls(dice_data):
         
         # 組裝給 AI 看的強制結果
         results_for_ai.append(f"玩家 [{player}] 執行 [{action_name}]：骰值 {final_val}，難度 {difficulty} ➔ 結果為【{res_text}】")
-        
+
     return "\n\n".join(messages), "\n".join(results_for_ai)
+
+# 裁判輸出的「需擲骰」JSON 擷取（容錯）。
+# 歷史 bug：擷取正則寫死要 ```json dice_request 標籤，但 dice.md 範例用的是「沒標籤」的純
+# ```json 區塊，模型一旦照規則省略標籤，骰子就被靜默丟棄、整回合不擲。這裡改成標籤可選，
+# 並逐步退讓到「任何含 need_roll 的 JSON」，確保該擲的骰一定擲得到。
+_DICE_FENCE_RE = re.compile(rf"{BK}\s*(?:json)?\s*(?:dice_request)?\s*\n?(\{{.*?\}})\s*{BK}",
+                            re.DOTALL | re.IGNORECASE)
+_DICE_BARE_RE = re.compile(r"\{[^{}]*\"need_roll\"[^{}]*\}|\{.*\"need_roll\".*\}", re.DOTALL | re.IGNORECASE)
+
+def _coerce_dice_data(obj):
+    """把模型可能吐出的兩種格式正規化成 {need_roll, actions:[...]}。
+    扁平單一動作（有 difficulty/action）→ 包成 actions；有 actions 卻漏 need_roll → 補 True。"""
+    if not isinstance(obj, dict):
+        return None
+    if "actions" not in obj and (obj.get("difficulty") is not None or obj.get("action")):
+        return {"need_roll": True, "actions": [obj]}
+    if obj.get("actions") and "need_roll" not in obj:
+        obj["need_roll"] = True
+    return obj
+
+def extract_dice_data(text):
+    """從裁判回應抽出擲骰指令，回傳正規化後的 dict 或 None。
+    依序嘗試：含 dice_request 標籤的圍欄 → 任何 json 圍欄 → 裸 JSON。
+    只接受「看起來是擲骰請求」（含 need_roll / actions / difficulty）的物件。"""
+    candidates = []
+    for m in _DICE_FENCE_RE.finditer(text):
+        candidates.append(m.group(1))
+    for m in _DICE_BARE_RE.finditer(text):
+        candidates.append(m.group(0))
+    for raw in candidates:
+        try:
+            obj = json.loads(raw.strip())
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if "need_roll" not in obj and "actions" not in obj and obj.get("difficulty") is None and not obj.get("action"):
+            continue  # 不像擲骰請求，跳過
+        return _coerce_dice_data(obj)
+    return None
 
 # ==========================================
 # 讀取與存檔功能 
@@ -619,35 +662,20 @@ MONSTER_DATABASE [怪物圖鑑]
                     try: await status_msg.delete() 
                     except: pass
                     
-                    pattern_dice = rf"{BK}json[\s\n]*dice_request[\s\n]*(.*?)\n{BK}"
-                    match_dice = re.search(pattern_dice, dice_req_text, re.DOTALL | re.IGNORECASE)
-                    
-                    if match_dice:
+                    # 容錯擷取：標籤可選、可退讓到裸 JSON，避免模型省略 dice_request 標籤時整回合不擲骰。
+                    dice_data = extract_dice_data(dice_req_text)
+                    if dice_data and dice_data.get("need_roll"):
                         try:
-                            dice_data = json.loads(match_dice.group(1).strip())
-                            # 正規化：相容兩種 dice_request 格式，避免該擲的骰被靜默丟棄。
-                            # dice.md 規定「扁平單一動作」{player,action,difficulty,...}，
-                            # 而本處 user prompt 規定「包裝格式」{need_roll, actions:[...]}；AI 可能吐任一種。
-                            # 缺 actions 但像個動作（有 difficulty/action）→ 包成 actions 陣列並視為需擲骰；
-                            # 有 actions 卻漏寫 need_roll → 補為 True。
-                            if isinstance(dice_data, dict):
-                                if "actions" not in dice_data and (
-                                    dice_data.get("difficulty") is not None or dice_data.get("action")
-                                ):
-                                    dice_data = {"need_roll": True, "actions": [dice_data]}
-                                elif dice_data.get("actions") and "need_roll" not in dice_data:
-                                    dice_data["need_roll"] = True
-                            if dice_data.get("need_roll"):
-                                # 呼叫 Python 裁判引擎擲骰
-                                broadcast_msg, ai_report = execute_dice_rolls(dice_data)
-                                
-                                # 立即向 Discord 發布擲骰結果
-                                await message.channel.send(f"🎲 **[命運之輪轉動]**\n{broadcast_msg}")
-                                
-                                # 將絕對不可篡改的結果交給 AI
-                                dice_result_for_ai = f"【裁判系統擲骰結果】(絕對鐵則：你必須完全依照此結果敘事，禁止擅自修改成功/失敗或大成功/大失敗的結論！)\n{ai_report}"
+                            # 呼叫 Python 裁判引擎擲骰
+                            broadcast_msg, ai_report = execute_dice_rolls(dice_data)
+
+                            # 立即向 Discord 發布擲骰結果
+                            await message.channel.send(f"🎲 **[命運之輪轉動]**\n{broadcast_msg}")
+
+                            # 將絕對不可篡改的結果交給 AI
+                            dice_result_for_ai = f"【裁判系統擲骰結果】(絕對鐵則：你必須完全依照此結果敘事，禁止擅自修改成功/失敗或大成功/大失敗的結論！)\n{ai_report}"
                         except Exception as e:
-                            print(f"擲骰解析失敗: {e}")
+                            print(f"擲骰執行失敗: {e}")
 
                     # 組合第二階段敘事 Prompt
                     dungeon_creation_prompt = f"""
@@ -748,8 +776,13 @@ MONSTER_DATABASE [怪物圖鑑]
 
                     # 防呆：擲骰一律由階段一的 Python 裁判處理。說書人若仍誤吐 dice_request，
                     # 既不執行也不得外洩給玩家，這裡統一從可見內容剔除（避免裸 JSON 漏到聊天室）。
-                    reply_text = re.sub(rf"{BK}json\s+dice_request\s*.*?{BK}", "",
-                                        reply_text, flags=re.DOTALL | re.IGNORECASE).strip()
+                    # ⚠️ 不能只認 dice_request 標籤——模型常吐「沒標籤」的純 ```json 區塊，舊版漏剔造成洩漏。
+                    # 改為「凡圍欄內容含 need_roll / dice_request 字樣就整塊剝除」，與標籤無關。
+                    def _strip_dice_block(m):
+                        body = m.group(0)
+                        return "" if re.search(r"need_roll|dice_request", body, re.IGNORECASE) else body
+                    reply_text = re.sub(rf"{BK}.*?{BK}", _strip_dice_block,
+                                        reply_text, flags=re.DOTALL).strip()
 
                     SAVE_TARGETS = {
                         "encyclopedia": save_encyclopedia,
