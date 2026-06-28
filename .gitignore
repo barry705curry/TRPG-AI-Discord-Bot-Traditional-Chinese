@@ -10,3 +10,7 @@ venv/
 # IDE / 編輯器
 .idea/
 .vscode/
+
+# 執行期存檔（遊戲存檔，非原始碼）：忽略 data/ 下的 JSON，但保留模板
+data/*.json
+!data/templates/

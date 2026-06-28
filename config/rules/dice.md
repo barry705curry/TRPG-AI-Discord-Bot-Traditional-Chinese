@@ -36,19 +36,31 @@
 
    > 禁止在骰子結果返回前預判成功或失敗。
 
-   `dice_request` 必須包含：
+   `dice_request` 必須是以下「包裝格式」：頂層含 `need_roll`，所有要判定的動作放進 `actions` 陣列（可多筆）。
 
    ```json
    {
-     "player": "玩家名稱",
-     "action": "玩家行動",
-     "difficulty": 數值1~100,
-     "modifier": 調整值,
-     "advantage": true/false,
-     "disadvantage": true/false
+     "need_roll": true,
+     "actions": [
+       {
+         "player": "玩家名稱",
+         "action": "玩家行動",
+         "difficulty": 數值1~100,
+         "modifier": 調整值,
+         "advantage": true/false,
+         "disadvantage": true/false
+       }
+     ]
    }
+   ```
+
+   若本回合「完全無須判定」（純閒聊或單純移動），則輸出：
+
+   ```json
+   { "need_roll": false }
    ```
 
    其中 `difficulty` 與 `modifier` 必須由 GM 根據：環境、玩家能力、情報完整度、行動合理性、當前狀態，進行判定。
 
    > 禁止省略 modifier。禁止省略 difficulty。禁止使用固定難度、固定調整值。
+   > 格式鐵則：一律使用上述「`need_roll` + `actions` 陣列」包裝格式，禁止直接輸出單一動作的扁平物件。

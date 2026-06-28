@@ -4,6 +4,7 @@ import json
 import asyncio
 import os
 import re
+import shutil
 import aiofiles
 import uuid
 import random
@@ -49,11 +50,36 @@ TARGET_MODEL = 'gemini-2.5-flash'
 # ==========================================
 # 2. 檔案路徑與核心工具
 # ==========================================
+DATA_DIR = 'data'
+TEMPLATE_DIR = 'data/templates'
+
 DATA_FILE = 'data/characters.json'
 ENCYCLOPEDIA_FILE = 'data/encyclopedia.json'
 GAME_WORLD_FILE = 'data/Game_World.json'
 DUNGEON_HISTORY_FILE = 'data/Dungeon_History.json'
 MONSTER_FILE = 'data/Monster.json'
+
+# 執行期存檔 → 對應的初始模板。
+# 存檔（data/*.json）本身被 git 忽略，data/templates/ 內的模板才是各檔結構的「唯一真相來源」；
+# 要調整資料格式請改模板，clone 後首次啟動會依模板自動生成缺少的存檔。
+DATA_TEMPLATES = {
+    DATA_FILE: 'characters.template.json',
+    ENCYCLOPEDIA_FILE: 'encyclopedia.template.json',
+    GAME_WORLD_FILE: 'Game_World.template.json',
+    DUNGEON_HISTORY_FILE: 'Dungeon_History.template.json',
+    MONSTER_FILE: 'Monster.template.json',
+}
+
+def ensure_data_files():
+    """確保 data/ 資料夾與各存檔存在；缺檔（或空檔）則由 templates/ 複製初始結構。
+    只在「不存在或為 0 byte」時複製，絕不覆寫進行中的存檔。"""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    for target, template_name in DATA_TEMPLATES.items():
+        if os.path.exists(target) and os.path.getsize(target) > 0:
+            continue
+        template_path = os.path.join(TEMPLATE_DIR, template_name)
+        if os.path.exists(template_path):
+            shutil.copyfile(template_path, target)
 
 BK = "`" * 3
 gm_lock = asyncio.Lock()
@@ -196,6 +222,32 @@ async def save_encyclopedia(data):
     async with aiofiles.open(ENCYCLOPEDIA_FILE, 'w', encoding='utf-8') as f:
         await f.write(json.dumps(merged, ensure_ascii=False, indent=2))
 
+# Game_World 根層「唯一合法」的 key；其餘都屬於 public。
+GAME_WORLD_ROOT_KEYS = ("current_status", "player_ready", "public", "secret")
+
+def _is_blank(v):
+    """視為「無有效值」：None / 空字串 / 未定 / 空 dict / 空 list。"""
+    return v is None or v == "" or v == "未定" or v == {} or v == []
+
+def normalize_game_world(data):
+    """把 AI 誤放在根層的 public 欄位（如 theme、current_location）收回 public，
+    確保根層只剩 GAME_WORLD_ROOT_KEYS。deep_merge 會照搬 AI 給的結構，
+    AI 偶爾把欄位吐在最外層 → 這裡統一歸位，避免根層長出重複的影子欄位。
+    衝突時 public 既有有效值優先；public 為空/未定時才採用根層的值（救回誤放資料）。"""
+    if not isinstance(data, dict):
+        return data
+    pub = data.get("public")
+    if not isinstance(pub, dict):
+        pub = {}
+        data["public"] = pub
+    for key in list(data.keys()):
+        if key in GAME_WORLD_ROOT_KEYS:
+            continue
+        stray = data.pop(key)  # 移出迷路的根層 key
+        if key not in pub or _is_blank(pub.get(key)):
+            pub[key] = stray
+    return data
+
 async def load_game_world():
     data = {}
     if os.path.exists(GAME_WORLD_FILE):
@@ -228,6 +280,7 @@ async def load_game_world():
     if "secret" not in data or not isinstance(data["secret"], dict):
         data["secret"] = {}
 
+    normalize_game_world(data)  # 讀取時即把舊存檔中迷路的根層欄位歸位
     return data
 
 async def save_game_world(data, overwrite=False):
@@ -243,6 +296,7 @@ async def save_game_world(data, overwrite=False):
         if old.get("current_status") == "副本進行中" and "secret" in old:
             final["secret"] = old["secret"]
 
+    normalize_game_world(final)  # 寫入前歸位：deep_merge 後 AI 誤放根層的欄位收回 public
     async with aiofiles.open(GAME_WORLD_FILE, 'w', encoding='utf-8') as f:
         await f.write(json.dumps(final, ensure_ascii=False, indent=2))
 
@@ -571,6 +625,18 @@ MONSTER_DATABASE [怪物圖鑑]
                     if match_dice:
                         try:
                             dice_data = json.loads(match_dice.group(1).strip())
+                            # 正規化：相容兩種 dice_request 格式，避免該擲的骰被靜默丟棄。
+                            # dice.md 規定「扁平單一動作」{player,action,difficulty,...}，
+                            # 而本處 user prompt 規定「包裝格式」{need_roll, actions:[...]}；AI 可能吐任一種。
+                            # 缺 actions 但像個動作（有 difficulty/action）→ 包成 actions 陣列並視為需擲骰；
+                            # 有 actions 卻漏寫 need_roll → 補為 True。
+                            if isinstance(dice_data, dict):
+                                if "actions" not in dice_data and (
+                                    dice_data.get("difficulty") is not None or dice_data.get("action")
+                                ):
+                                    dice_data = {"need_roll": True, "actions": [dice_data]}
+                                elif dice_data.get("actions") and "need_roll" not in dice_data:
+                                    dice_data["need_roll"] = True
                             if dice_data.get("need_roll"):
                                 # 呼叫 Python 裁判引擎擲骰
                                 broadcast_msg, ai_report = execute_dice_rolls(dice_data)
@@ -587,7 +653,11 @@ MONSTER_DATABASE [怪物圖鑑]
                     dungeon_creation_prompt = f"""
                     【GM 任務：推進劇情】
                     {dice_result_for_ai}
-                    請根據玩家行動與上方【裁判系統擲骰結果】推進劇情，給出沉浸感的敘事回覆。
+                    ⚠️【擲骰已由系統裁判處理，嚴禁自行擲骰】：本系統採「Python 獨立裁判」，是否擲骰與骰值結果一律由系統於上一階段決定。
+                    　你【絕對禁止】自行輸出任何 `dice_request` JSON、也不得自行宣告骰值或成功/失敗。
+                    　- 若上方有【裁判系統擲骰結果】：直接依其成敗（含大成功/大失敗）敘事。
+                    　- 若上方顯示「無須擲骰」：直接順暢推進劇情，不要要求或暗示玩家擲骰。
+                    請根據玩家行動與上方結果推進劇情，給出沉浸感的敘事回覆。
                     📍【位置追蹤｜每回合必做】：本回合敘事結束後，請務必在回覆最後輸出以下精簡標籤，
                     　以 {{角色名: 地點}} 逐一填入每位角色「這一幕結束時」的所在位置（移動了就更新，沒移動就照填目前位置）。
                     　隊伍在一起時就把各角色填成同一地點；分頭行動時各自填各自的位置。
@@ -675,6 +745,11 @@ MONSTER_DATABASE [怪物圖鑑]
                             if mem_data.get("trigger"): trigger_memory = True
                             reply_text = re.sub(pattern_mem, "", reply_text, flags=re.DOTALL | re.IGNORECASE).strip()
                         except: pass
+
+                    # 防呆：擲骰一律由階段一的 Python 裁判處理。說書人若仍誤吐 dice_request，
+                    # 既不執行也不得外洩給玩家，這裡統一從可見內容剔除（避免裸 JSON 漏到聊天室）。
+                    reply_text = re.sub(rf"{BK}json\s+dice_request\s*.*?{BK}", "",
+                                        reply_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
                     SAVE_TARGETS = {
                         "encyclopedia": save_encyclopedia,
@@ -786,4 +861,5 @@ MONSTER_DATABASE [怪物圖鑑]
             except Exception as e:
                 await message.channel.send(f"主神系統外層發生異常：{e}")
 
+ensure_data_files()
 client.run(DISCORD_TOKEN)
